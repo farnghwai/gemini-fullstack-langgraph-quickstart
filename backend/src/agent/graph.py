@@ -33,6 +33,8 @@ from agent.utils import (
     resolve_urls,
 )
 from langchain_community.tools import DuckDuckGoSearchResults
+import pprint  # for better formatting
+import json
 
 load_dotenv()
 
@@ -43,6 +45,7 @@ load_dotenv()
 # genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 ollama_model = "qwen3:8b"
+ollama_num_ctx = 32768
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
@@ -91,6 +94,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         format = SearchQueryList.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
         options = {
             "temperature": 1.0,
+            "num_ctx": ollama_num_ctx
         },
         stream = False
     )
@@ -109,7 +113,6 @@ def continue_to_web_research(state: QueryGenerationState):
         for idx, search_query in enumerate(state["query_list"])
     ]
 
-import pprint  # for better formatting
 search_client = DuckDuckGoSearchResults(output_format="list")
 
 duckduckgo_search_tool = {
@@ -133,14 +136,14 @@ def duckduckgo_search(query: str) -> str:
     """
 
     # The cast is necessary as returned tool call arguments don't always conform exactly to schema
-    # return search_client.invoke(query)
-    result = generate(
-        model = ollama_model,
-        prompt = query,
-        think = False,
-        stream = False
-    )
-    return result.response
+    return search_client.invoke(query)
+    # result = generate(
+    #     model = ollama_model,
+    #     prompt = query,
+    #     think = False,
+    #     stream = False
+    # )
+    # return result.response
 
 
 available_functions = {
@@ -166,7 +169,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         current_date=get_current_date(),
         research_topic=state["search_query"],
     )
-    # print("formatted_prompt")
+    print("formatted_prompt")
     # print(formatted_prompt)
     # Uses the google genai client as the langchain client doesn't return grounding metadata
     # response = genai_client.models.generate_content(
@@ -183,35 +186,42 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
             "content": formatted_prompt
         }
     ]
-
-    # response = chat(
-    #     model = ollama_model,
-    #     messages = messages,
-    #     tools = [duckduckgo_search_tool],
-    #     think = True,
-    #     options = {
-    #         "temperature": 0,
-    #     },
-    #     stream = False
-    # )
+    
+    response = chat(
+        model = ollama_model,
+        messages = messages,
+        tools = [duckduckgo_search_tool],
+        think = True,
+        options = {
+            "temperature": 0.0,
+            "num_ctx": ollama_num_ctx
+        },
+        stream = False
+    )
     # print("web_research response")
     # print(response.message.thinking)  # See what's actually sent
     # print("done thinking")
-    # print(response.message.content)  # See what's actually sent
+    # print(response.message)  # See what's actually sent
+    # messages.append(response.message)
+    url_list = []
+    if response.message.tool_calls:
+        # There may be multiple tool calls in the response
+        for tool in response.message.tool_calls:
+            # Ensure the function is available, and then call it
+            if function_to_call := available_functions.get(tool.function.name):
+                print('Calling function:', tool.function.name)
+                print('Arguments:', tool.function.arguments)
+                
+                web_search_result = function_to_call(**tool.function.arguments)
+                web_search_result_links = [{'label': item['title'], 'url': item['link']} for item in web_search_result]
+                web_search_result_links = list({(item['label'], item['url']) for item in web_search_result_links})
+                url_list.extend(web_search_result_links)
 
-    # if response.message.tool_calls:
-    #     # There may be multiple tool calls in the response
-    #     for tool in response.message.tool_calls:
-    #         # Ensure the function is available, and then call it
-    #         if function_to_call := available_functions.get(tool.function.name):
-    #             print('Calling function:', tool.function.name)
-    #             print('Arguments:', tool.function.arguments)
-    #             # output = function_to_call(**tool.function.arguments)
-    #             # print('Function output:', output)
-    #             # messages.append(response.message)
-    #             # messages.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
-    #         else:
-    #             print('Function', tool.function.name, 'not found')
+                # # print('Function output:', output)
+                result_content = json.dumps(web_search_result, indent=2, ensure_ascii=False, default=str)
+                messages.append({'role': 'tool', 'content': result_content, 'name': tool.function.name})
+            else:
+                print('Function', tool.function.name, 'not found')
 
     # Only needed to chat with the model using the tool call results
     # if response.message.tool_calls:
@@ -223,15 +233,16 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     #     print(response.message)
     # else:
     #     print('No tool calls returned from model')
-    # final_response = chat(        
-    #     model = ollama_model,
-    #     messages = messages,
-    #     think = True,
-    #     options = {
-    #         "temperature": 0,
-    #     },
-    #     stream = False
-    # )
+    final_response = chat(        
+        model = ollama_model,
+        messages = messages,
+        think = True,
+        options = {
+            "temperature": 0,
+            "num_ctx": ollama_num_ctx
+        },
+        stream = False
+    )
     print("end response")
     # resolve the urls to short urls for saving tokens and time
     # resolved_urls = resolve_urls(
@@ -241,8 +252,8 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     # citations = get_citations(response, resolved_urls)
     # modified_text = insert_citation_markers(response.text, citations)
     # sources_gathered = [item for citation in citations for item in citation["segments"]]
-    sources_gathered = [""]
-    modified_text = "" #final_response.message.content
+    sources_gathered = url_list
+    modified_text = final_response.message.content
     return {
         "sources_gathered": sources_gathered,
         "search_query": [state["search_query"]],
@@ -298,25 +309,26 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
             "content": formatted_prompt
         }
     ]
-    print("reflection formatted_prompt")    
+    # print("reflection formatted_prompt")    
     # print(formatted_prompt)
-    # result = chat(
-    #     model = ollama_model,
-    #     messages = messages,
-    #     think = False,
-    #     format = Reflection.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
-    #     options = {
-    #         "temperature": 1.0,
-    #     },
-    #     stream = False
-    # )
+    result = chat(
+        model = ollama_model,
+        messages = messages,
+        think = False,
+        format = Reflection.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
+        options = {
+            "temperature": 1.0,
+            "num_ctx": ollama_num_ctx
+        },
+        stream = False
+    )
     print("reflection")
     # print(result.follow_up_queries)
-    # reflectionResult = Reflection.model_validate_json(result.message.content)
+    reflectionResult = Reflection.model_validate_json(result.message.content)
     return {
-        "is_sufficient": True, #reflectionResult.is_sufficient,
-        "knowledge_gap": "", #reflectionResult.knowledge_gap,
-        "follow_up_queries": [], #reflectionResult.follow_up_queries,
+        "is_sufficient": reflectionResult.is_sufficient,
+        "knowledge_gap": reflectionResult.knowledge_gap,
+        "follow_up_queries": reflectionResult.follow_up_queries,
         "research_loop_count": state["research_loop_count"],
         "number_of_ran_queries": len(state["search_query"]),
     }
@@ -384,7 +396,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
     print("finalize_answer formatted_prompt")
-    print(formatted_prompt)
+    # print(formatted_prompt)
     # init Reasoning Model, default to Gemini 2.5 Flash
     # llm = ChatGoogleGenerativeAI(
     #     model=reasoning_model,
@@ -399,11 +411,12 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         think = True,
         options = {
             "temperature": 0.0,
+            "num_ctx": ollama_num_ctx
         },
         stream = False
     )
     print("finalize_answer")
-    print(result.response)
+    # print(result.response)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
