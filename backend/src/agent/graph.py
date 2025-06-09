@@ -7,7 +7,8 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+# from google.genai import Client
+from ollama import chat, generate
 
 from agent.state import (
     OverallState,
@@ -23,22 +24,25 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_ollama import ChatOllama
 from agent.utils import (
     get_citations,
     get_research_topic,
     insert_citation_markers,
     resolve_urls,
 )
+from langchain_community.tools import DuckDuckGoSearchResults
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+# if os.getenv("GEMINI_API_KEY") is None:
+#     raise ValueError("GEMINI_API_KEY is not set")
 
 # Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+# genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+ollama_model = "qwen3:8b"
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
@@ -61,13 +65,13 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
     # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    # llm = ChatGoogleGenerativeAI(
+    #     model=configurable.query_generator_model,
+    #     temperature=1.0,
+    #     max_retries=2,
+    #     api_key=os.getenv("GEMINI_API_KEY"),
+    # )
+    # structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
     current_date = get_current_date()
@@ -76,9 +80,23 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
+
     # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
-    return {"query_list": result.query}
+    # result = structured_llm.invoke(formatted_prompt)
+    # return {"query_list": result.query}
+    result = generate(
+        model = ollama_model,
+        prompt = formatted_prompt,
+        think = False,
+        format = SearchQueryList.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
+        options = {
+            "temperature": 1.0,
+        },
+        stream = False
+    )
+    
+    searchQueryResult = SearchQueryList.model_validate_json(result.response)
+    return {"query_list": searchQueryResult.query}
 
 
 def continue_to_web_research(state: QueryGenerationState):
@@ -90,6 +108,44 @@ def continue_to_web_research(state: QueryGenerationState):
         Send("web_research", {"search_query": search_query, "id": int(idx)})
         for idx, search_query in enumerate(state["query_list"])
     ]
+
+import pprint  # for better formatting
+search_client = DuckDuckGoSearchResults(output_format="list")
+
+duckduckgo_search_tool = {
+  'type': 'function',
+  'function': {
+    'name': 'duckduckgo_search',
+    'description': 'Search using DuckDuckGo',
+    'parameters': {
+      'type': 'object',
+      'required': ['query'],
+      'properties': {
+        'query': {'type': 'string', 'description': 'The query'},
+      },
+    },
+  },
+}
+
+def duckduckgo_search(query: str) -> str:
+    """
+    Search DuckDuckGo for recent results
+    """
+
+    # The cast is necessary as returned tool call arguments don't always conform exactly to schema
+    # return search_client.invoke(query)
+    result = generate(
+        model = ollama_model,
+        prompt = query,
+        think = False,
+        stream = False
+    )
+    return result.response
+
+
+available_functions = {
+  'duckduckgo_search': duckduckgo_search,
+}
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
@@ -110,25 +166,83 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         current_date=get_current_date(),
         research_topic=state["search_query"],
     )
-
+    # print("formatted_prompt")
+    # print(formatted_prompt)
     # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+    # response = genai_client.models.generate_content(
+    #     model=configurable.query_generator_model,
+    #     contents=formatted_prompt,
+    #     config={
+    #         "tools": [{"google_search": {}}],
+    #         "temperature": 0,
+    #     },
+    # )
+    messages = [
+        {
+            "role": 'user',
+            "content": formatted_prompt
+        }
+    ]
 
+    # response = chat(
+    #     model = ollama_model,
+    #     messages = messages,
+    #     tools = [duckduckgo_search_tool],
+    #     think = True,
+    #     options = {
+    #         "temperature": 0,
+    #     },
+    #     stream = False
+    # )
+    # print("web_research response")
+    # print(response.message.thinking)  # See what's actually sent
+    # print("done thinking")
+    # print(response.message.content)  # See what's actually sent
+
+    # if response.message.tool_calls:
+    #     # There may be multiple tool calls in the response
+    #     for tool in response.message.tool_calls:
+    #         # Ensure the function is available, and then call it
+    #         if function_to_call := available_functions.get(tool.function.name):
+    #             print('Calling function:', tool.function.name)
+    #             print('Arguments:', tool.function.arguments)
+    #             # output = function_to_call(**tool.function.arguments)
+    #             # print('Function output:', output)
+    #             # messages.append(response.message)
+    #             # messages.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
+    #         else:
+    #             print('Function', tool.function.name, 'not found')
+
+    # Only needed to chat with the model using the tool call results
+    # if response.message.tool_calls:
+    #     # Add the function response to messages for the model to use
+    #     # messages.append(response.message)
+    #     # messages.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
+    #     messages.append({'role': 'tool', 'content': "", 'name': tool.function.name})
+    #     print("tool call")
+    #     print(response.message)
+    # else:
+    #     print('No tool calls returned from model')
+    # final_response = chat(        
+    #     model = ollama_model,
+    #     messages = messages,
+    #     think = True,
+    #     options = {
+    #         "temperature": 0,
+    #     },
+    #     stream = False
+    # )
+    print("end response")
+    # resolve the urls to short urls for saving tokens and time
+    # resolved_urls = resolve_urls(
+    #     response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+    # )
+    # Gets the citations and adds them to the generated text
+    # citations = get_citations(response, resolved_urls)
+    # modified_text = insert_citation_markers(response.text, citations)
+    # sources_gathered = [item for citation in citations for item in citation["segments"]]
+    sources_gathered = [""]
+    modified_text = "" #final_response.message.content
     return {
         "sources_gathered": sources_gathered,
         "search_query": [state["search_query"]],
@@ -163,18 +277,46 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    # llm = ChatGoogleGenerativeAI(
+    #     model=reasoning_model,
+    #     temperature=1.0,
+    #     max_retries=2,
+    #     api_key=os.getenv("GEMINI_API_KEY"),
+    # )
+    # result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    # return {
+    #     "is_sufficient": result.is_sufficient,
+    #     "knowledge_gap": result.knowledge_gap,
+    #     "follow_up_queries": result.follow_up_queries,
+    #     "research_loop_count": state["research_loop_count"],
+    #     "number_of_ran_queries": len(state["search_query"]),
+    # }    
 
+    messages = [
+        {
+            "role": 'user',
+            "content": formatted_prompt
+        }
+    ]
+    print("reflection formatted_prompt")    
+    # print(formatted_prompt)
+    # result = chat(
+    #     model = ollama_model,
+    #     messages = messages,
+    #     think = False,
+    #     format = Reflection.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
+    #     options = {
+    #         "temperature": 1.0,
+    #     },
+    #     stream = False
+    # )
+    print("reflection")
+    # print(result.follow_up_queries)
+    # reflectionResult = Reflection.model_validate_json(result.message.content)
     return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
+        "is_sufficient": True, #reflectionResult.is_sufficient,
+        "knowledge_gap": "", #reflectionResult.knowledge_gap,
+        "follow_up_queries": [], #reflectionResult.follow_up_queries,
         "research_loop_count": state["research_loop_count"],
         "number_of_ran_queries": len(state["search_query"]),
     }
@@ -196,6 +338,7 @@ def evaluate_research(
     Returns:
         String literal indicating the next node to visit ("web_research" or "finalize_summary")
     """
+    print("evaluate_research")
     configurable = Configuration.from_runnable_config(config)
     max_research_loops = (
         state.get("max_research_loops")
@@ -240,27 +383,39 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         research_topic=get_research_topic(state["messages"]),
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
-
+    print("finalize_answer formatted_prompt")
+    print(formatted_prompt)
     # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+    # llm = ChatGoogleGenerativeAI(
+    #     model=reasoning_model,
+    #     temperature=0,
+    #     max_retries=2,
+    #     api_key=os.getenv("GEMINI_API_KEY"),
+    # )
+    # result = llm.invoke(formatted_prompt)
+    result = generate(
+        model = ollama_model,
+        prompt = formatted_prompt,
+        think = True,
+        options = {
+            "temperature": 0.0,
+        },
+        stream = False
     )
-    result = llm.invoke(formatted_prompt)
+    print("finalize_answer")
+    print(result.response)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
+    # for source in state["sources_gathered"]:
+    #     if source["short_url"] in result.content:
+    #         result.content = result.content.replace(
+    #             source["short_url"], source["value"]
+    #         )
+    #         unique_sources.append(source)
 
     return {
-        "messages": [AIMessage(content=result.content)],
+        "messages": [AIMessage(content=result.response)],
         "sources_gathered": unique_sources,
     }
 
@@ -290,4 +445,7 @@ builder.add_conditional_edges(
 # Finalize the answer
 builder.add_edge("finalize_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+from langgraph.checkpoint.memory import InMemorySaver
+checkpointer = InMemorySaver()
+
+graph = builder.compile(name="pro-search-agent", checkpointer=checkpointer)
