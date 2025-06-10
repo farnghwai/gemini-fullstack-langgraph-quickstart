@@ -18,7 +18,6 @@ dependencies = [
     "fastapi",
     "ollama>=0.5.1",
     "duckduckgo-search>=8.0.2",
-    "langchain-community>=0.3.24",
 ]
 
 

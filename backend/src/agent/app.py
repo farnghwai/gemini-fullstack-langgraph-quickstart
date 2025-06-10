@@ -170,32 +170,37 @@ async def stream_handler(thread_id: str, request: Request):
     config = {"configurable": {"thread_id": thread_id}}
 
     async def event_stream():
-        # print("***graph stream start***")
-        counter = 0;
-        for chunk_stream_mode, chunk in graph.stream(state, stream_mode=stream_mode, config=config):
-            counter = counter + 1
-            # print(f"counter {counter} [{chunk_stream_mode}]")    
-            # print(chunk)        
+        try:
+            # print("***graph stream start***")
+            counter = 0;
+            for chunk_stream_mode, chunk in graph.stream(state, stream_mode=stream_mode, config=config):
+                counter = counter + 1
+                # print(f"counter {counter} [{chunk_stream_mode}]")    
+                # print(chunk)        
 
-            if (chunk_stream_mode == "messages"): 
-                message_chunk, metadata = chunk
-     
-                # print("message_chunk")
-                serialize_chunk = [serialize_item(message_chunk)]
+                if (chunk_stream_mode == "messages"): 
+                    message_chunk, metadata = chunk
+        
+                    # print("message_chunk")
+                    serialize_chunk = [serialize_item(message_chunk)]
 
-                yield f"event: metadata\n"
-                yield f"data: {json.dumps(metadata)}\n\n"
+                    yield f"event: metadata\n"
+                    yield f"data: {json.dumps(metadata, default=str)}\n\n"
 
-            else:   
-                serialize_chunk = serialize_item(chunk)
-             
-            # print("after")
-            # print(serialize_chunk)
-            yield f"event: {chunk_stream_mode}\n"
-            yield f"data: {json.dumps(serialize_chunk)}\n\n"
-
-            # print(f"---end counter {counter} ")
-        # print("***graph stream end***")
+                else:   
+                    serialize_chunk = serialize_item(chunk)
+                
+                # print("after")
+                # print(serialize_chunk)
+                yield f"event: {chunk_stream_mode}\n"
+                yield f"data: {json.dumps(serialize_chunk, default=str)}\n\n"
+                # print(f"---end counter {counter} ")
+            # print("***graph stream end***")
+        except Exception as e:
+            print("Encounter exception")
+            print(json.dumps(e, default=str))
+            yield f"event: error\n"
+            yield f"data: {json.dumps(e, default=str)}\n\n"
 
     return StreamingResponse(event_stream())
 

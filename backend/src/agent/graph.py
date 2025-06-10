@@ -32,7 +32,7 @@ from agent.utils import (
     insert_citation_markers,
     resolve_urls,
 )
-from langchain_community.tools import DuckDuckGoSearchResults
+from duckduckgo_search import DDGS
 import pprint  # for better formatting
 import json
 
@@ -44,7 +44,6 @@ load_dotenv()
 # Used for Google Search API
 # genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-ollama_model = "qwen3:8b"
 ollama_num_ctx = 32768
 
 # Nodes
@@ -88,12 +87,12 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     # result = structured_llm.invoke(formatted_prompt)
     # return {"query_list": result.query}
     result = generate(
-        model = ollama_model,
+        model = configurable.query_generator_model,
         prompt = formatted_prompt,
         think = False,
         format = SearchQueryList.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
         options = {
-            "temperature": 1.0,
+            # "temperature": 1.0,
             "num_ctx": ollama_num_ctx
         },
         stream = False
@@ -113,8 +112,6 @@ def continue_to_web_research(state: QueryGenerationState):
         for idx, search_query in enumerate(state["query_list"])
     ]
 
-search_client = DuckDuckGoSearchResults(output_format="list")
-
 duckduckgo_search_tool = {
   'type': 'function',
   'function': {
@@ -130,21 +127,28 @@ duckduckgo_search_tool = {
   },
 }
 
+def remove_duplicates_set(lst):
+    seen = set()
+    unique_list = []
+    for item in lst:
+        # Convert dict to tuple of sorted items for hashing
+        item_tuple = tuple(sorted(item.items()))
+        if item_tuple not in seen:
+            seen.add(item_tuple)
+            unique_list.append(item)
+    return unique_list
+
 def duckduckgo_search(query: str) -> str:
     """
     Search DuckDuckGo for recent results
     """
-
-    # The cast is necessary as returned tool call arguments don't always conform exactly to schema
-    return search_client.invoke(query)
-    # result = generate(
-    #     model = ollama_model,
-    #     prompt = query,
-    #     think = False,
-    #     stream = False
-    # )
-    # return result.response
-
+    try:
+        return DDGS().text(query, max_results=5)
+    except RatelimitException as e:
+        # handle RateLimitException gracefully
+        print("RatelimitException")
+        print(json.dumps(e, default=str))
+        return []
 
 available_functions = {
   'duckduckgo_search': duckduckgo_search,
@@ -169,7 +173,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         current_date=get_current_date(),
         research_topic=state["search_query"],
     )
-    print("formatted_prompt")
+    print("web_research formatted_prompt")
     # print(formatted_prompt)
     # Uses the google genai client as the langchain client doesn't return grounding metadata
     # response = genai_client.models.generate_content(
@@ -188,7 +192,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     ]
     
     response = chat(
-        model = ollama_model,
+        model = configurable.query_generator_model,
         messages = messages,
         tools = [duckduckgo_search_tool],
         think = True,
@@ -213,8 +217,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
                 print('Arguments:', tool.function.arguments)
                 
                 web_search_result = function_to_call(**tool.function.arguments)
-                web_search_result_links = [{'label': item['title'], 'url': item['link']} for item in web_search_result]
-                web_search_result_links = list({(item['label'], item['url']) for item in web_search_result_links})
+                web_search_result_links = [{'label': item['title'], 'url': item['href']} for item in web_search_result]
                 url_list.extend(web_search_result_links)
 
                 # # print('Function output:', output)
@@ -234,16 +237,16 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     # else:
     #     print('No tool calls returned from model')
     final_response = chat(        
-        model = ollama_model,
+        model = configurable.query_generator_model,
         messages = messages,
         think = True,
         options = {
-            "temperature": 0,
+            "temperature": 0.0,
             "num_ctx": ollama_num_ctx
         },
         stream = False
     )
-    print("end response")
+    print("web_research end response")
     # resolve the urls to short urls for saving tokens and time
     # resolved_urls = resolve_urls(
     #     response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
@@ -252,7 +255,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     # citations = get_citations(response, resolved_urls)
     # modified_text = insert_citation_markers(response.text, citations)
     # sources_gathered = [item for citation in citations for item in citation["segments"]]
-    sources_gathered = url_list
+    sources_gathered = remove_duplicates_set(url_list)    
     modified_text = final_response.message.content
     return {
         "sources_gathered": sources_gathered,
@@ -312,12 +315,12 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     # print("reflection formatted_prompt")    
     # print(formatted_prompt)
     result = chat(
-        model = ollama_model,
+        model = reasoning_model,
         messages = messages,
         think = False,
         format = Reflection.model_json_schema(),  # Use Pydantic to generate the schema or format=schema
         options = {
-            "temperature": 1.0,
+            # "temperature": 1.0,
             "num_ctx": ollama_num_ctx
         },
         stream = False
@@ -406,7 +409,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     # )
     # result = llm.invoke(formatted_prompt)
     result = generate(
-        model = ollama_model,
+        model = reasoning_model,
         prompt = formatted_prompt,
         think = True,
         options = {
@@ -419,13 +422,14 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     # print(result.response)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
-    unique_sources = []
+    # unique_sources = []
     # for source in state["sources_gathered"]:
     #     if source["short_url"] in result.content:
     #         result.content = result.content.replace(
     #             source["short_url"], source["value"]
     #         )
     #         unique_sources.append(source)
+    unique_sources = remove_duplicates_set(state["sources_gathered"])
 
     return {
         "messages": [AIMessage(content=result.response)],
